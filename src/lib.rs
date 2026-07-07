@@ -1,6 +1,6 @@
 #![no_std]
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Timer};
 use embedded_hal_async::digital::Wait;
 
