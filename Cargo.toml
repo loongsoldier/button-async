@@ -2,6 +2,11 @@
 name = "button-async"
 version = "0.1.0"
 edition = "2024"
+description = "Async embedded-hal button driver with single-click, double-click, and long-press detection"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/loongsoldier/button-async"
+keywords = ["embedded", "button", "async", "no-std", "embassy"]
+categories = ["embedded", "no-std"]
 
 [dependencies]
 embassy-futures = "0.1"
