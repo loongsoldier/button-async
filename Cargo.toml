@@ -1,0 +1,9 @@
+[package]
+name = "button-async"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+embassy-futures = "0.1"
+embassy-time = "0.5"
+embedded-hal-async = "1.0.0"
