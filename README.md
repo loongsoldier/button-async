@@ -8,8 +8,8 @@ Detects **single-click**, **double-click**, and **long-press** events using a si
 
 - `#![no_std]` — works on any embedded target
 - Async-first: integrates naturally with Embassy and other async executors
-- Three event types: `SingleClick`, `DoubleClick`, `LongPress`
-- Configurable long-press duration and double-click window
+- `Click(u32)` with click count and `LongPress(u32)` with duration in ms
+- Configurable long-press duration and multi-click window (using `Duration`)
 - Supports both active-low (`Falling` edge) and active-high (`Rising` edge) buttons
 
 ## Usage
@@ -22,9 +22,11 @@ let mut button = Button::new(pin);
 
 loop {
     match button.next_event().await {
-        ButtonEvent::SingleClick => { /* handle single click */ }
-        ButtonEvent::DoubleClick => { /* handle double click */ }
-        ButtonEvent::LongPress   => { /* handle long press */ }
+        Ok(ButtonEvent::Click(1)) => { /* handle single click */ }
+        Ok(ButtonEvent::Click(2)) => { /* handle double click */ }
+        Ok(ButtonEvent::Click(n)) => { /* handle n-click */ }
+        Ok(ButtonEvent::LongPress(dur)) => { /* handle long press, dur in ms */ }
+        Err(_) => { /* handle pin error */ }
     }
 }
 ```
@@ -33,10 +35,11 @@ loop {
 
 ```rust
 use button_async::{Button, ButtonConfig, ButtonEdge};
+use embassy_time::Duration;
 
 let config = ButtonConfig {
-    long_press_ms: 800,
-    double_click_window_ms: 300,
+    long_press: Duration::from_millis(800),
+    click_window: Duration::from_millis(300),
 };
 let mut button = Button::with_config(pin, config, ButtonEdge::Rising);
 ```
@@ -45,10 +48,11 @@ let mut button = Button::with_config(pin, config, ButtonEdge::Rising);
 
 `next_event()` waits for a press, then races the release against a long-press timer:
 
-- **Release before timeout** → waits for a second press within the double-click window:
-  - Second press detected → `DoubleClick`
-  - Window expires → `SingleClick`
-- **Long-press timer fires first** → waits for release, then returns `LongPress`
+- **Release before timeout** → enters a click-counting loop:
+  - Count starts at 1, then waits for another press within the click window:
+  - Another press detected → count increments, reset window, continue loop
+  - Window expires → returns `Click(count)` (1 for single, 2 for double, N for N-click)
+- **Long-press timer fires first** → waits for release, returns `LongPress(dur)` where `dur` is the actual hold time in ms
 
 ## License
 

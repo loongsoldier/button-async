@@ -1,8 +1,8 @@
 [package]
 name = "button-async"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
-description = "Async embedded-hal button driver with single-click, double-click, and long-press detection"
+description = "Async embedded-hal button driver with N-click counting and long-press duration detection"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/loongsoldier/button-async"
 keywords = ["embedded", "button", "async", "no-std", "embassy"]

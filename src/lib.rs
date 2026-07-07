@@ -1,30 +1,32 @@
 #![no_std]
 
 use embassy_futures::select::{Either, select};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_async::digital::Wait;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonEvent {
-    SingleClick,
-    DoubleClick,
-    LongPress,
+    Click(u32),
+    LongPress(u32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonEdge {
     Falling,
     Rising,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct ButtonConfig {
-    pub long_press_ms: u64,
-    pub double_click_window_ms: u64,
+    pub long_press: Duration,
+    pub click_window: Duration,
 }
 
 impl Default for ButtonConfig {
     fn default() -> Self {
         Self {
-            long_press_ms: 600,
-            double_click_window_ms: 200,
+            long_press: Duration::from_millis(600),
+            click_window: Duration::from_millis(200),
         }
     }
 }
@@ -60,50 +62,56 @@ impl<P: Wait> Button<P> {
         }
     }
 
-    pub async fn next_event(&mut self) -> ButtonEvent {
-        let long_ms = self.config.long_press_ms;
-        let double_ms = self.config.double_click_window_ms;
+    pub async fn next_event(&mut self) -> Result<ButtonEvent, P::Error> {
+        let long_press = self.config.long_press;
+        let click_window = self.config.click_window;
 
-        self.wait_for_press().await;
+        self.wait_for_press().await?;
+        let pressed_at = Instant::now();
 
-        match select(
-            self.wait_for_release(),
-            Timer::after(Duration::from_millis(long_ms)),
-        )
-        .await
-        {
-            Either::First(_) => {
-                match select(
-                    self.wait_for_press(),
-                    Timer::after(Duration::from_millis(double_ms)),
-                )
-                .await
-                {
-                    Either::First(_) => {
-                        self.wait_for_release().await;
-                        ButtonEvent::DoubleClick
+        match select(self.wait_for_release(), Timer::after(long_press)).await {
+            Either::First(result) => {
+                result?;
+                let mut count: u32 = 1;
+                loop {
+                    match select(self.wait_for_press(), Timer::after(click_window)).await {
+                        Either::First(result) => {
+                            result?;
+                            match select(self.wait_for_release(), Timer::after(long_press)).await {
+                                Either::First(result) => {
+                                    result?;
+                                    count += 1;
+                                }
+                                Either::Second(()) => {
+                                    return Ok(ButtonEvent::Click(count));
+                                }
+                            }
+                        }
+                        Either::Second(()) => {
+                            return Ok(ButtonEvent::Click(count));
+                        }
                     }
-                    Either::Second(_) => ButtonEvent::SingleClick,
                 }
             }
-            Either::Second(_) => {
-                self.wait_for_release().await;
-                ButtonEvent::LongPress
+            Either::Second(()) => {
+                self.wait_for_release().await?;
+                let dur = pressed_at.elapsed().as_millis() as u32;
+                Ok(ButtonEvent::LongPress(dur))
             }
         }
     }
 
-    async fn wait_for_press(&mut self) {
+    async fn wait_for_press(&mut self) -> Result<(), P::Error> {
         match self.active_edge {
-            ButtonEdge::Falling => self.pin.wait_for_falling_edge().await.ok(),
-            ButtonEdge::Rising => self.pin.wait_for_rising_edge().await.ok(),
-        };
+            ButtonEdge::Falling => self.pin.wait_for_falling_edge().await,
+            ButtonEdge::Rising => self.pin.wait_for_rising_edge().await,
+        }
     }
 
-    async fn wait_for_release(&mut self) {
+    async fn wait_for_release(&mut self) -> Result<(), P::Error> {
         match self.active_edge {
-            ButtonEdge::Falling => self.pin.wait_for_rising_edge().await.ok(),
-            ButtonEdge::Rising => self.pin.wait_for_falling_edge().await.ok(),
-        };
+            ButtonEdge::Falling => self.pin.wait_for_rising_edge().await,
+            ButtonEdge::Rising => self.pin.wait_for_falling_edge().await,
+        }
     }
 }
