@@ -114,6 +114,7 @@ impl<P: Wait + InputPin, H: OnPress> Button<P, H> {
                     match select(self.wait_for_press(), Timer::after(click_window)).await {
                         Either::First(result) => {
                             result?;
+                            self.config.on_press.pressed().await;
                             match select(self.wait_for_release(), Timer::after(long_press)).await {
                                 Either::First(result) => {
                                     result?;
