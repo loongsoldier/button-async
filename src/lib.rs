@@ -1,6 +1,6 @@
 #![no_std]
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::digital::InputPin;
 use embedded_hal_async::digital::Wait;
@@ -67,15 +67,10 @@ enum State {
     /// Waiting for release after long‑press has been confirmed
     /// (or after `MultiClick` was already emitted for an interrupted
     /// multi‑click sequence).
-    Holding {
-        pressed_at: Instant,
-    },
+    Holding { pressed_at: Instant },
     /// Released, waiting for another press within the multi‑click
     /// window or for the window to expire.
-    BetweenClicks {
-        count: u32,
-        last_release: Instant,
-    },
+    BetweenClicks { count: u32, last_release: Instant },
 }
 
 // ── Button ────────────────────────────────────────────────────────
@@ -123,21 +118,14 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
                         if elapsed >= threshold {
                             if from_click_count > 0 {
                                 self.state = State::Holding { pressed_at };
-                                return Ok(ButtonEvent::MultiClick(
-                                    from_click_count,
-                                ));
+                                return Ok(ButtonEvent::MultiClick(from_click_count));
                             }
                             self.state = State::Holding { pressed_at };
                             continue;
                         }
 
                         let remaining = threshold - elapsed;
-                        match select(
-                            self.wait_for_release(),
-                            Timer::after(remaining),
-                        )
-                        .await
-                        {
+                        match select(self.wait_for_release(), Timer::after(remaining)).await {
                             Either::First(result) => {
                                 result?;
                                 let hold = pressed_at.elapsed();
@@ -152,11 +140,8 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
                             }
                             Either::Second(()) => {
                                 if from_click_count > 0 {
-                                    self.state =
-                                        State::Holding { pressed_at };
-                                    return Ok(ButtonEvent::MultiClick(
-                                        from_click_count,
-                                    ));
+                                    self.state = State::Holding { pressed_at };
+                                    return Ok(ButtonEvent::MultiClick(from_click_count));
                                 }
                                 self.state = State::Holding { pressed_at };
                                 continue;
@@ -194,11 +179,8 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
                     count,
                     last_release,
                 } => {
-                    let deadline =
-                        last_release + self.config.multi_click_timeout;
-                    match select(self.wait_for_press(), Timer::at(deadline))
-                        .await
-                    {
+                    let deadline = last_release + self.config.multi_click_timeout;
+                    match select(self.wait_for_press(), Timer::at(deadline)).await {
                         Either::First(result) => {
                             result?;
                             let now = Instant::now();
@@ -238,6 +220,13 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
 
     async fn wait_for_press(&mut self) -> Result<(), P::Error> {
         let debounce = self.config.debounce;
+
+        // Fast path: pin may already be at the pressed level
+        // (startup, Idle re‑entry while button held, etc.)
+        if self.is_pressed()? {
+            return Ok(());
+        }
+
         loop {
             if self.config.active_low {
                 self.pin.wait_for_falling_edge().await?;
@@ -253,6 +242,14 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
 
     async fn wait_for_release(&mut self) -> Result<(), P::Error> {
         let debounce = self.config.debounce;
+
+        // Fast path: pin may already be at the released level
+        // (catch‑up: button released during delayed next_event() call,
+        //  or select timer won the race before the release edge)
+        if !self.is_pressed()? {
+            return Ok(());
+        }
+
         loop {
             if self.config.active_low {
                 self.pin.wait_for_rising_edge().await?;
