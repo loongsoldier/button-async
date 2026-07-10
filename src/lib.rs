@@ -1,6 +1,6 @@
 #![no_std]
 
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::digital::InputPin;
 use embedded_hal_async::digital::Wait;
@@ -67,10 +67,15 @@ enum State {
     /// Waiting for release after long‑press has been confirmed
     /// (or after `MultiClick` was already emitted for an interrupted
     /// multi‑click sequence).
-    Holding { pressed_at: Instant },
+    Holding {
+        pressed_at: Instant,
+    },
     /// Released, waiting for another press within the multi‑click
     /// window or for the window to expire.
-    BetweenClicks { count: u32, last_release: Instant },
+    BetweenClicks {
+        count: u32,
+        last_release: Instant,
+    },
 }
 
 // ── Button ────────────────────────────────────────────────────────
@@ -116,11 +121,23 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
 
                         // Catch‑up: threshold already passed
                         if elapsed >= threshold {
-                            return self.transition_to_holding(pressed_at, from_click_count);
+                            if from_click_count > 0 {
+                                self.state = State::Holding { pressed_at };
+                                return Ok(ButtonEvent::MultiClick(
+                                    from_click_count,
+                                ));
+                            }
+                            self.state = State::Holding { pressed_at };
+                            continue;
                         }
 
                         let remaining = threshold - elapsed;
-                        match select(self.wait_for_release(), Timer::after(remaining)).await {
+                        match select(
+                            self.wait_for_release(),
+                            Timer::after(remaining),
+                        )
+                        .await
+                        {
                             Either::First(result) => {
                                 result?;
                                 let hold = pressed_at.elapsed();
@@ -134,7 +151,15 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
                                 });
                             }
                             Either::Second(()) => {
-                                return self.transition_to_holding(pressed_at, from_click_count);
+                                if from_click_count > 0 {
+                                    self.state =
+                                        State::Holding { pressed_at };
+                                    return Ok(ButtonEvent::MultiClick(
+                                        from_click_count,
+                                    ));
+                                }
+                                self.state = State::Holding { pressed_at };
+                                continue;
                             }
                         }
                     } else {
@@ -169,8 +194,11 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
                     count,
                     last_release,
                 } => {
-                    let deadline = last_release + self.config.multi_click_timeout;
-                    match select(self.wait_for_press(), Timer::at(deadline)).await {
+                    let deadline =
+                        last_release + self.config.multi_click_timeout;
+                    match select(self.wait_for_press(), Timer::at(deadline))
+                        .await
+                    {
                         Either::First(result) => {
                             result?;
                             let now = Instant::now();
@@ -191,33 +219,6 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
     }
 
     // ── helpers ───────────────────────────────────────────────
-
-    /// Called when the first long‑press threshold was crossed in
-    /// `Pressed`.
-    ///
-    /// * `from_click_count > 0` → emit `MultiClick` first, then wait
-    ///   for release in `Holding` on the next call.
-    /// * `from_click_count == 0` → switch to `Holding` silently; the
-    ///   outer `loop` will re‑enter and hit the `Holding` arm which
-    ///   blocks until release.
-    fn transition_to_holding(
-        &mut self,
-        pressed_at: Instant,
-        from_click_count: u32,
-    ) -> Result<ButtonEvent, P::Error> {
-        if from_click_count > 0 {
-            self.state = State::Holding { pressed_at };
-            Ok(ButtonEvent::MultiClick(from_click_count))
-        } else {
-            self.state = State::Holding { pressed_at };
-            // Yield nothing — the caller is inside `loop { match … }`,
-            // so re‑entering will land on `Holding`.
-            panic!(
-                "transition_to_holding: pure long press — \
-                 this branch must be caught by the outer loop"
-            )
-        }
-    }
 
     /// Return the index of the highest threshold ≤ `hold`, or `None`.
     fn highest_long_press_index(&self, hold: Duration) -> Option<usize> {
