@@ -1,6 +1,6 @@
 [package]
 name = "button-async"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Async embedded-hal button driver with N-click counting and long-press duration detection"
 license = "MIT OR Apache-2.0"

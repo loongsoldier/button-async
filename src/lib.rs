@@ -13,39 +13,57 @@ pub enum ButtonEvent {
     /// Button released.
     ///
     /// `hold_duration` is the actual time the button was held.
-    /// `long_press` is the index of the **highest** crossed threshold
-    /// in [`ButtonConfig::long_press_thresholds`], or `None` if
-    /// no threshold was reached.
-    Released {
-        hold_duration: Duration,
-        long_press: Option<usize>,
-    },
+    Released { hold_duration: Duration },
     /// Multi‑click sequence completed.
     /// `1` = single click, `2` = double click, etc.
     MultiClick(u32),
+    /// Emitted periodically while the button is held after the long‑press
+    /// threshold has been reached.
+    ///
+    /// `hold_duration` is the total time the button has been held so far.
+    /// `count` is a 0‑based counter incremented with each emission.
+    ///
+    /// Only emitted when [`LongPressConfig::repeat_interval`] is set.
+    LongPressRepeat {
+        hold_duration: Duration,
+        /// 0‑based counter, incremented with each repeat emission.
+        count: u32,
+    },
+}
+
+/// Long‑press configuration.
+///
+/// When set, the button will detect when it has been held for at least
+/// `threshold`.  If `repeat_interval` is also set, periodic
+/// [`ButtonEvent::LongPressRepeat`] events are emitted after the
+/// threshold is reached until the button is released.
+#[derive(Debug, Clone, Copy)]
+pub struct LongPressConfig {
+    /// Minimum hold time to qualify as a long press.
+    pub threshold: Duration,
+    /// If set, emit [`ButtonEvent::LongPressRepeat`] at this interval
+    /// while the button remains held after `threshold`.
+    pub repeat_interval: Option<Duration>,
 }
 
 /// Button configuration.
 #[derive(Debug, Clone)]
-pub struct ButtonConfig<'a> {
+pub struct ButtonConfig {
     /// Debounce time.
     pub debounce: Duration,
-    /// Long‑press thresholds, **must be sorted ascending**.
-    /// An empty slice disables long‑press detection entirely.
-    pub long_press_thresholds: &'a [Duration],
+    /// Long‑press detection.  `None` disables long‑press entirely.
+    pub long_press: Option<LongPressConfig>,
     /// Multi‑click timeout window, measured from the last release.
     pub multi_click_timeout: Duration,
     /// `true` → low level is pressed, `false` → high level is pressed.
     pub active_low: bool,
 }
 
-static EMPTY_THRESHOLDS: [Duration; 0] = [];
-
-impl Default for ButtonConfig<'static> {
+impl Default for ButtonConfig {
     fn default() -> Self {
         Self {
             debounce: Duration::from_millis(20),
-            long_press_thresholds: &EMPTY_THRESHOLDS,
+            long_press: None,
             multi_click_timeout: Duration::from_millis(300),
             active_low: true,
         }
@@ -67,7 +85,13 @@ enum State {
     /// Waiting for release after long‑press has been confirmed
     /// (or after `MultiClick` was already emitted for an interrupted
     /// multi‑click sequence).
-    Holding { pressed_at: Instant },
+    ///
+    /// `repeat_count` is the count to use for the *next*
+    /// `LongPressRepeat` emission.
+    Holding {
+        pressed_at: Instant,
+        repeat_count: u32,
+    },
     /// Released, waiting for another press within the multi‑click
     /// window or for the window to expire.
     BetweenClicks { count: u32, last_release: Instant },
@@ -75,14 +99,14 @@ enum State {
 
 // ── Button ────────────────────────────────────────────────────────
 
-pub struct Button<'a, P: Wait + InputPin> {
+pub struct Button<P: Wait + InputPin> {
     pin: P,
-    config: ButtonConfig<'a>,
+    config: ButtonConfig,
     state: State,
 }
 
-impl<'a, P: Wait + InputPin> Button<'a, P> {
-    pub fn new(pin: P, config: ButtonConfig<'a>) -> Self {
+impl<P: Wait + InputPin> Button<P> {
+    pub fn new(pin: P, config: ButtonConfig) -> Self {
         Self {
             pin,
             config,
@@ -110,21 +134,21 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
                     pressed_at,
                     from_click_count,
                 } => {
-                    if !self.config.long_press_thresholds.is_empty() {
+                    if let Some(lp) = self.config.long_press {
                         let elapsed = pressed_at.elapsed();
-                        let threshold = self.config.long_press_thresholds[0];
+                        let has_repeat = lp.repeat_interval.is_some();
 
                         // Catch‑up: threshold already passed
-                        if elapsed >= threshold {
-                            if from_click_count > 0 {
-                                self.state = State::Holding { pressed_at };
-                                return Ok(ButtonEvent::MultiClick(from_click_count));
+                        if elapsed >= lp.threshold {
+                            if let Some(event) =
+                                self.enter_holding_or_emit(pressed_at, from_click_count, has_repeat)
+                            {
+                                return Ok(event);
                             }
-                            self.state = State::Holding { pressed_at };
                             continue;
                         }
 
-                        let remaining = threshold - elapsed;
+                        let remaining = lp.threshold - elapsed;
                         match select(self.wait_for_release(), Timer::after(remaining)).await {
                             Either::First(result) => {
                                 result?;
@@ -135,20 +159,21 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
                                 };
                                 return Ok(ButtonEvent::Released {
                                     hold_duration: hold,
-                                    long_press: None,
                                 });
                             }
                             Either::Second(()) => {
-                                if from_click_count > 0 {
-                                    self.state = State::Holding { pressed_at };
-                                    return Ok(ButtonEvent::MultiClick(from_click_count));
+                                if let Some(event) = self.enter_holding_or_emit(
+                                    pressed_at,
+                                    from_click_count,
+                                    has_repeat,
+                                ) {
+                                    return Ok(event);
                                 }
-                                self.state = State::Holding { pressed_at };
                                 continue;
                             }
                         }
                     } else {
-                        // No long‑press thresholds — pure multi‑click
+                        // No long‑press — pure multi‑click
                         self.wait_for_release().await?;
                         let hold = pressed_at.elapsed();
                         self.state = State::BetweenClicks {
@@ -157,21 +182,48 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
                         };
                         return Ok(ButtonEvent::Released {
                             hold_duration: hold,
-                            long_press: None,
                         });
                     }
                 }
 
                 // ── Holding ───────────────────────────────────
-                State::Holding { pressed_at } => {
-                    self.wait_for_release().await?;
-                    let hold = pressed_at.elapsed();
-                    let long_press = self.highest_long_press_index(hold);
-                    self.state = State::Idle;
-                    return Ok(ButtonEvent::Released {
-                        hold_duration: hold,
-                        long_press,
-                    });
+                State::Holding {
+                    pressed_at,
+                    repeat_count,
+                } => {
+                    if let Some(repeat_interval) =
+                        self.config.long_press.and_then(|lp| lp.repeat_interval)
+                    {
+                        match select(self.wait_for_release(), Timer::after(repeat_interval)).await {
+                            Either::First(result) => {
+                                result?;
+                                let hold = pressed_at.elapsed();
+                                self.state = State::Idle;
+                                return Ok(ButtonEvent::Released {
+                                    hold_duration: hold,
+                                });
+                            }
+                            Either::Second(()) => {
+                                let hold = pressed_at.elapsed();
+                                let count = repeat_count;
+                                self.state = State::Holding {
+                                    pressed_at,
+                                    repeat_count: repeat_count + 1,
+                                };
+                                return Ok(ButtonEvent::LongPressRepeat {
+                                    hold_duration: hold,
+                                    count,
+                                });
+                            }
+                        }
+                    } else {
+                        self.wait_for_release().await?;
+                        let hold = pressed_at.elapsed();
+                        self.state = State::Idle;
+                        return Ok(ButtonEvent::Released {
+                            hold_duration: hold,
+                        });
+                    }
                 }
 
                 // ── BetweenClicks ─────────────────────────────
@@ -202,12 +254,41 @@ impl<'a, P: Wait + InputPin> Button<'a, P> {
 
     // ── helpers ───────────────────────────────────────────────
 
-    /// Return the index of the highest threshold ≤ `hold`, or `None`.
-    fn highest_long_press_index(&self, hold: Duration) -> Option<usize> {
-        self.config
-            .long_press_thresholds
-            .iter()
-            .rposition(|&t| t <= hold)
+    /// Handle the transition out of `Pressed` when the long‑press
+    /// threshold is reached.
+    ///
+    /// Returns `Some(event)` if an event should be emitted, or `None`
+    /// if the caller should `continue` the main loop (state already
+    /// updated to `Holding`).
+    fn enter_holding_or_emit(
+        &mut self,
+        pressed_at: Instant,
+        from_click_count: u32,
+        has_repeat: bool,
+    ) -> Option<ButtonEvent> {
+        if from_click_count > 0 {
+            self.state = State::Holding {
+                pressed_at,
+                repeat_count: 0,
+            };
+            return Some(ButtonEvent::MultiClick(from_click_count));
+        }
+        if has_repeat {
+            let hold = pressed_at.elapsed();
+            self.state = State::Holding {
+                pressed_at,
+                repeat_count: 1,
+            };
+            return Some(ButtonEvent::LongPressRepeat {
+                hold_duration: hold,
+                count: 0,
+            });
+        }
+        self.state = State::Holding {
+            pressed_at,
+            repeat_count: 0,
+        };
+        None
     }
 
     fn is_pressed(&mut self) -> Result<bool, P::Error> {
