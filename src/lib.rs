@@ -17,32 +17,31 @@ pub enum ButtonEvent {
     /// Multi‑click sequence completed.
     /// `1` = single click, `2` = double click, etc.
     MultiClick(u32),
-    /// Emitted periodically while the button is held after the long‑press
-    /// threshold has been reached.
+    /// Long‑press threshold reached.  Re-emitted at
+    /// [`LongPressConfig::repeat_interval`] while the button remains held.
     ///
     /// `hold_duration` is the total time the button has been held so far.
     /// `count` is a 0‑based counter incremented with each emission.
-    ///
-    /// Only emitted when [`LongPressConfig::repeat_interval`] is set.
     LongPressRepeat {
         hold_duration: Duration,
-        /// 0‑based counter, incremented with each repeat emission.
+        /// 0‑based counter, incremented with each emission.
         count: u32,
     },
 }
 
 /// Long‑press configuration.
 ///
-/// When set, the button will detect when it has been held for at least
-/// `threshold`.  If `repeat_interval` is also set, periodic
-/// [`ButtonEvent::LongPressRepeat`] events are emitted after the
-/// threshold is reached until the button is released.
+/// When set, the button will emit [`ButtonEvent::LongPressRepeat`] once
+/// the button has been held for `threshold`.  If `repeat_interval` is
+/// set, additional `LongPressRepeat` events follow at that interval
+/// until the button is released.
 #[derive(Debug, Clone, Copy)]
 pub struct LongPressConfig {
     /// Minimum hold time to qualify as a long press.
     pub threshold: Duration,
-    /// If set, emit [`ButtonEvent::LongPressRepeat`] at this interval
-    /// while the button remains held after `threshold`.
+    /// Repeat interval for additional [`ButtonEvent::LongPressRepeat`]
+    /// events.  `None` means only a single `LongPressRepeat` is emitted
+    /// when the threshold is reached.
     pub repeat_interval: Option<Duration>,
 }
 
@@ -82,12 +81,11 @@ enum State {
         pressed_at: Instant,
         from_click_count: u32,
     },
-    /// Waiting for release after long‑press has been confirmed
-    /// (or after `MultiClick` was already emitted for an interrupted
-    /// multi‑click sequence).
+    /// Waiting for release after long‑press threshold has been reached.
     ///
     /// `repeat_count` is the count to use for the *next*
-    /// `LongPressRepeat` emission.
+    /// `LongPressRepeat` emission (already incremented past the
+    /// `count: 0` that was emitted when entering this state).
     Holding {
         pressed_at: Instant,
         repeat_count: u32,
@@ -136,16 +134,10 @@ impl<P: Wait + InputPin> Button<P> {
                 } => {
                     if let Some(lp) = self.config.long_press {
                         let elapsed = pressed_at.elapsed();
-                        let has_repeat = lp.repeat_interval.is_some();
 
                         // Catch‑up: threshold already passed
                         if elapsed >= lp.threshold {
-                            if let Some(event) =
-                                self.enter_holding_or_emit(pressed_at, from_click_count, has_repeat)
-                            {
-                                return Ok(event);
-                            }
-                            continue;
+                            return Ok(self.enter_holding(pressed_at, from_click_count));
                         }
 
                         let remaining = lp.threshold - elapsed;
@@ -162,14 +154,7 @@ impl<P: Wait + InputPin> Button<P> {
                                 });
                             }
                             Either::Second(()) => {
-                                if let Some(event) = self.enter_holding_or_emit(
-                                    pressed_at,
-                                    from_click_count,
-                                    has_repeat,
-                                ) {
-                                    return Ok(event);
-                                }
-                                continue;
+                                return Ok(self.enter_holding(pressed_at, from_click_count));
                             }
                         }
                     } else {
@@ -254,41 +239,28 @@ impl<P: Wait + InputPin> Button<P> {
 
     // ── helpers ───────────────────────────────────────────────
 
-    /// Handle the transition out of `Pressed` when the long‑press
-    /// threshold is reached.
+    /// Transition out of `Pressed` when the long‑press threshold has
+    /// been reached (via catch‑up or timer).
     ///
-    /// Returns `Some(event)` if an event should be emitted, or `None`
-    /// if the caller should `continue` the main loop (state already
-    /// updated to `Holding`).
-    fn enter_holding_or_emit(
-        &mut self,
-        pressed_at: Instant,
-        from_click_count: u32,
-        has_repeat: bool,
-    ) -> Option<ButtonEvent> {
+    /// Emits `LongPressRepeat { count: 0 }` to signal the long press,
+    /// or `MultiClick` if a multi‑click sequence was interrupted.
+    fn enter_holding(&mut self, pressed_at: Instant, from_click_count: u32) -> ButtonEvent {
         if from_click_count > 0 {
             self.state = State::Holding {
                 pressed_at,
                 repeat_count: 0,
             };
-            return Some(ButtonEvent::MultiClick(from_click_count));
+            return ButtonEvent::MultiClick(from_click_count);
         }
-        if has_repeat {
-            let hold = pressed_at.elapsed();
-            self.state = State::Holding {
-                pressed_at,
-                repeat_count: 1,
-            };
-            return Some(ButtonEvent::LongPressRepeat {
-                hold_duration: hold,
-                count: 0,
-            });
-        }
+        let hold = pressed_at.elapsed();
         self.state = State::Holding {
             pressed_at,
-            repeat_count: 0,
+            repeat_count: 1,
         };
-        None
+        ButtonEvent::LongPressRepeat {
+            hold_duration: hold,
+            count: 0,
+        }
     }
 
     fn is_pressed(&mut self) -> Result<bool, P::Error> {
